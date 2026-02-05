@@ -1,242 +1,157 @@
 """
-단기 메모리(Short-term): 에이전트의 state에 넣어, 여러 턴 대화를 가능하게 함
-같은 thread 안에서만 이어지는 기억 (대화 히스토리 같은 것)
-
-장기 메모리(Long-term): 세션이 바뀌어도 유지되는 사용자별 / 앱 전체 데이터를 저장
-thread가 달라도 유지되는 기억 (유저 프로필/선호/설정 같은 것)
+██████╗ ██╗ ██████╗  █████╗  ██████╗██╗  ██╗ █████╗ ██████╗ 
+██╔════╝ ██║██╔════╝ ██╔══██╗██╔════╝██║  ██║██╔══██╗██╔══██╗
+██║  ███╗██║██║  ███╗███████║██║     ███████║███████║██║  ██║
+██║   ██║██║██║   ██║██╔══██║██║     ██╔══██║██╔══██║██║  ██║
+╚██████╔╝██║╚██████╔╝██║  ██║╚██████╗██║  ██║██║  ██║██████╔╝
+ ╚═════╝ ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ 
+                                User Interactive Edition
 """
-
-#---------------------------------------
-#Add short-term memory
-#---------------------------------------
-# # use in production (postgres, mongodb, redis)
+# 한글 주석: 기가채드 페르소나와 메모리 전략(Trim/Summarize)을 선택할 수 있는 대화형 봇 서비스 파일입니다.
+import os
+import sys
 from dotenv import load_dotenv
+from pymongo import MongoClient
+from langgraph.checkpoint.mongodb import MongoDBSaver
+from langgraph.graph import START, StateGraph, MessagesState
+from langchain_core.messages.utils import trim_messages, count_tokens_approximately
+from langchain.chat_models import init_chat_model
+from langchain.messages import HumanMessage, RemoveMessage, SystemMessage
+
+# 환경 변수 로드
 load_dotenv()
 
-#use in subgraphs
-#서브그래프의 메모리는 기본적으로 부모 그래프가 관리, 필요하면 서브그래프만 따로 독립 메모리를 가질 수 있음 > 멀티에이전트
-from langgraph.graph import START, StateGraph
-from langgraph.checkpoint.memory import InMemorySaver
-from typing import TypedDict
-from langgraph.types import Command, interrupt
+def clear_screen():
+    """터미널 화면을 정리하는 함수"""
+    os.system('cls' if os.name == 'nt' else 'clear')
 
-class State(TypedDict):
-    foo: str
+# MongoDB 설정
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017")
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
+    client.server_info()
+    # 인프라 연결 로그는 숨김 처리하여 난잡함을 줄임
+except Exception as e:
+    print(f"❌ MongoDB 연결 실패: {e}")
+    sys.exit(1)
 
-# Subgraph
-def subgraph_node_1(state: State):
-    answer = interrupt({"question": "continue?"})
-    return {"foo": state["foo"] + answer}
-
-subgraph_builder = StateGraph(State)
-subgraph_builder.add_node(subgraph_node_1)
-subgraph_builder.add_edge(START, "subgraph_node_1")
-subgraph = subgraph_builder.compile()
-# subgraph = subgraph_builder.compile(checkpointer=True) # 부모 그래프와 별도로 메모리를 관리할 수 있음     
-
-# Parent graph
-builder = StateGraph(State)
-builder.add_node("subgraph_node_1", subgraph)
-builder.add_edge(START, "subgraph_node_1")
-
-checkpointer = InMemorySaver()
-graph = builder.compile(checkpointer=checkpointer)
-
-config = {
-    "configurable": {
-        "thread_id": "1"
-    }
-}
-
-result = graph.invoke({"foo": "a"}, config)
-print(result["__interrupt__"])
-
-graph.invoke(Command(resume="X"), config)
-
-history = list(graph.get_state_history(config))
-
-subgraph_namespaces = set()
-
-for snap in history:
-    for task in snap.tasks or []:
-        state = task.state
-        if state and "checkpoint_ns" in state.get("configurable", {}):
-            subgraph_namespaces.add(
-                state["configurable"]["checkpoint_ns"]
-            )
-
-for ns in subgraph_namespaces:
-    sub_config = {
-        "configurable": {
-            "thread_id": "1",
-            "checkpoint_ns": ns
-        }
-    }
-
-    print(f"\n--- subgraph memory: {ns} ---")
-    print(list(graph.get_state_history(sub_config)))
-
-
-#---------------------------------------
-#Manage short-term memory (LLM에 매 호출마다 그대로 들어가, 토큰 제한에 걸릴 수 있음)
-#---------------------------------------
-
-##1. Trim ##
-print("\n========trim=========\n")
-from langchain_core.messages.utils import (
-    trim_messages,  
-    count_tokens_approximately  
-)
-from langchain.chat_models import init_chat_model
-from langgraph.graph import StateGraph, START, MessagesState
-from langgraph.checkpoint.memory import InMemorySaver 
-
+# 기가채드 모델 및 페르소나 설정
 model = init_chat_model("gemini-flash-latest", model_provider="google_genai")
+# 마크다운 강조 기호를 절대 쓰지 않도록 지침 추가
+GIGACHAD_PROMPT = SystemMessage(content=(
+    "넌 기가채드(GigaChad)다. 근육질이고 자신감이 넘치며 압도적이다. "
+    "말은 짧고 굵게 명언처럼 한다. 나약함은 죄악이다. 무조건 한국어로 대답해라. "
+    "중요: 절대로 ** 또는 _ 같은 마크다운 강조 기호를 사용하지 마라. 오직 평문으로만 대답해라."
+))
 
-def call_model(state: MessagesState):
-    messages = trim_messages(  
-        state["messages"],
-        strategy="last", #어디를 남길지(last: 마지막, first: 첫번째)
-        token_counter=count_tokens_approximately, #빠른 근사 토큰 계산
-        max_tokens=128, #결과 메시지들의 총 토큰 수 ≤ 128
-        start_on="human", #잘린 결과가 HumanMessage부터 시작
-        end_on=("human", "tool"), #어디까지 끝낼지(ToolMessage 뒤에 AI가 바로 오지 않게 정리)
-    )
-    # messages = state["messages"] #제한이 없으면 다 기억함
-    response = model.invoke(messages)
-    return {"messages": [response]}
+# ------------------------------------------------------------------
+# 전략 1: Trim (Focus Mode) - 최신 대화에만 집중
+# ------------------------------------------------------------------
+def get_trim_graph():
+    def call_model_trim(state: MessagesState):
+        trimmed_messages = trim_messages(  
+            state["messages"],
+            strategy="last", 
+            token_counter=count_tokens_approximately, 
+            max_tokens=80, 
+            start_on="human", 
+            end_on=("human", "tool"), 
+        )
+        messages = [GIGACHAD_PROMPT] + trimmed_messages
+        response = model.invoke(messages)
+        return {"messages": [response]}
 
-checkpointer = InMemorySaver()
-builder = StateGraph(MessagesState)
-builder.add_node(call_model)
-builder.add_edge(START, "call_model")
-graph = builder.compile(checkpointer=checkpointer)
+    builder = StateGraph(MessagesState)
+    builder.add_node("call_model", call_model_trim)
+    builder.add_edge(START, "call_model")
+    return builder.compile(checkpointer=MongoDBSaver(client))
 
-config = {"configurable": {"thread_id": "1"}}
-result1 = graph.invoke({"messages": "안녕 내 이름은 김철수야."}, config)
-result1["messages"][-1].pretty_print()
-
-result2 = graph.invoke({"messages": "고양이들에 대한 짧은 시를 작성해줘."}, config)
-result2["messages"][-1].pretty_print()
-
-result3 = graph.invoke({"messages": "같은 작업을 하는데, 강아지로 해줘."}, config)
-result3["messages"][-1].pretty_print()
-
-final_response = graph.invoke({"messages": "내 이름은 뭐야?"}, config)
-final_response["messages"][-1].pretty_print() #철수를 잊음
-
-print("\n", [(message.type, message.content) for message in final_response["messages"]])
-
-#2. Delete ##
-print("\n========delete=========\n")
-from langchain.messages import RemoveMessage  
-
-def delete_messages(state):
-    messages = state["messages"]
-    if len(messages) > 2:
-        print("\n==메시지 개수가 제한을 초과했습니다!==\n")
-        # remove the earliest two messages
-        return {"messages": [RemoveMessage(id=m.id) for m in messages[:2]]}  #RemoveMessage(id=REMOVE_ALL_MESSAGES) : 모든 메시지 삭제
-
-def call_model(state: MessagesState):
-    response = model.invoke(state["messages"])
-    return {"messages": response}
-
-builder = StateGraph(MessagesState)
-builder.add_sequence([call_model, delete_messages])
-builder.add_edge(START, "call_model")
-
-checkpointer = InMemorySaver()
-app = builder.compile(checkpointer=checkpointer)
-
-config = {"configurable": {"thread_id": "2"}}
-for event in app.stream(
-    {"messages": [{"role": "user", "content": "안녕! 난 영희야"}]},
-    config,
-    stream_mode="values"
-):
-    print("first invoke", [(message.type, message.content) for message in event["messages"]])
-
-for event in app.stream(
-    {"messages": [{"role": "user", "content": "내 이름이 뭐야?"}]},
-    config,
-    stream_mode="values"
-):
-    print("second invoke", [(message.type, message.content) for message in event["messages"]])
-
-# checkpointer.delete_thread(thread_id) #thread 삭제
-
-##3. Summarize ##
-# pip install langmem
-print("\n========summarize=========\n")
-from langgraph.graph import StateGraph, START
-from langgraph.graph import MessagesState
-from langgraph.checkpoint.memory import InMemorySaver
-
-from langchain.chat_models import init_chat_model
-from langchain.messages import HumanMessage, RemoveMessage
-
-model = init_chat_model("gemini-flash-latest", model_provider="google_genai")
-
-class State(MessagesState):
+# ------------------------------------------------------------------
+# 전략 2: Summarize (Wisdom Mode) - 과거를 압축하여 기억
+# ------------------------------------------------------------------
+class SummaryState(MessagesState):
     summary: str
 
-# 요약 노드
-def summarize_conversation(state: State):
-    summary = state.get("summary", "")
+def get_summary_graph():
+    def summarize_conversation(state: SummaryState):
+        summary = state.get("summary", "")
+        if summary:
+            summary_message = f"이전 요약: {summary}\n\n위의 새로운 대화를 포함하여 요약을 확장하라. 핵심만 짧게 기가채드 스타일로 요약하라."
+        else:
+            summary_message = "위의 대화를 기가채드 스타일로 핵심만 요약하라:"
+        
+        response = model.invoke(state["messages"] + [HumanMessage(content=summary_message)])
+        delete_messages = [RemoveMessage(id=m.id) for m in state["messages"][:-2]]
+        return {"summary": response.content, "messages": delete_messages}
 
-    if summary:
-        summary_message = (
-            f"This is a summary of the conversation to date:\n{summary}\n\n"
-            "Extend the summary by taking into account the new messages above:"
-        )
+    def call_model_summary(state: SummaryState):
+        messages = state["messages"]
+        if state.get("summary"):
+            messages = [HumanMessage(content=f"[이전의 기억]: {state['summary']}")] + messages
+        
+        messages = [GIGACHAD_PROMPT] + messages
+        response = model.invoke(messages)
+        return {"messages": [response]}
+
+    builder = StateGraph(SummaryState)
+    builder.add_node("summarize", summarize_conversation)
+    builder.add_node("call_model", call_model_summary)
+    builder.add_edge(START, "call_model")
+    builder.add_edge("call_model", "summarize")
+    return builder.compile(checkpointer=MongoDBSaver(client))
+
+# ------------------------------------------------------------------
+# 메인 루프
+# ------------------------------------------------------------------
+def main():
+    clear_screen()
+    print(__doc__)
+    print(" [1] 집중 훈련 (Trim) | [2] 지혜의 샘 (Summarize)")
+    
+    choice = input("\n > 훈련 방식을 선택하라 (1/2): ").strip()
+    user_id = input(" > ID를 입력하라 (default: legend): ").strip() or "legend"
+    
+    if choice == "1":
+        graph = get_trim_graph()
+        mode_name = "Focus (Trim)"
     else:
-        summary_message = "Create a summary of the conversation above:"
+        graph = get_summary_graph()
+        mode_name = "Wisdom (Summarize)"
 
-    messages = state["messages"] + [HumanMessage(content=summary_message)]
-    response = model.invoke(messages)
+    config = {"configurable": {"thread_id": user_id}}
+    
+    clear_screen()
+    print(f"--- {mode_name} 모드 활성화 (ID: {user_id}) ---")
+    print(" [종료하려면 'q'를 입력하라]\n")
 
-    # 메시지 정리 (최근 2개만 유지)
-    delete_messages = [
-        RemoveMessage(id=m.id)
-        for m in state["messages"][:-2]
-    ]
+    while True:
+        try:
+            user_input = input(" [You]: ").strip()
+            if user_input.lower() in ["q", "exit"]:
+                print("\n GigaChad: 오늘 훈련은 여기까지다. 나약해지지 마라.\n")
+                break
+            
+            if not user_input:
+                continue
 
-    return {
-        "summary": response.content,
-        "messages": delete_messages,
-    }
-
-
-def call_model(state: State):
-    messages = state["messages"]
-
-    if state.get("summary"):
-        messages = [
-            HumanMessage(
-                content=f"(Conversation summary)\n{state['summary']}"
+            # 그래프 실행
+            events = graph.stream(
+                {"messages": [HumanMessage(content=user_input)]}, 
+                config, 
+                stream_mode="values"
             )
-        ] + messages
+            
+            last_msg = None
+            for event in events:
+                if "messages" in event:
+                    last_msg = event["messages"][-1]
+            
+            if last_msg and last_msg.type == "ai":
+                print(f" [GigaChad]: {last_msg.content}\n")
+            
+        except Exception as e:
+            print(f"\n [Error]: {e}")
+            break
 
-    response = model.invoke(messages)
-    return {"messages": [response]}
-
-builder = StateGraph(State)
-builder.add_node("summarize", summarize_conversation)
-builder.add_node("call_model", call_model)
-builder.add_edge(START, "call_model")
-builder.add_edge("call_model", "summarize")
-
-graph = builder.compile(checkpointer=InMemorySaver())
-
-config = {"configurable": {"thread_id": "1"}}
-
-graph.invoke({"messages": "안녕 내 이름은 김철수야"}, config)
-graph.invoke({"messages": "고양이에 대한 짧은 시를 써줘"}, config)
-graph.invoke({"messages": "강아지로 해줘"}, config)
-final = graph.invoke({"messages": "내 이름은 뭐야?"}, config)
-
-final["messages"][-1].pretty_print()
-print("\nSummary:", final["summary"])
-
-# print(f"\n\n ========history=========\n:{list(graph.get_state_history(config))}")
+if __name__ == "__main__":
+    main()
